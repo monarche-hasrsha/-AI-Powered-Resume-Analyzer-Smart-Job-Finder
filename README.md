@@ -1,5 +1,10 @@
 # AI-Powered Résumé Analyzer & Smart Job Finder
 
+
+
+https://github.com/user-attachments/assets/152d9139-b882-4048-928a-f2b2b8e68110
+
+
 A Streamlit application that leverages local LLMs (via **Ollama**) and the **SerpAPI Google Jobs** engine to:
 
 1. Parse and summarise your résumé
