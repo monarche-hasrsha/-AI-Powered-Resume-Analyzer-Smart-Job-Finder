@@ -1,4 +1,4 @@
-# AI-Powered Résumé Analyzer & Smart Job Finder
+# AI-Powered Resume Analyzer & Smart Job Finder
 
 
 
