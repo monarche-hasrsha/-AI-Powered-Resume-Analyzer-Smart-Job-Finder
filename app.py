@@ -3,27 +3,19 @@
 # Updated: Proper SerpAPI Google Jobs API implementation with correct parameters
 # ---------------------------------------------------------------
 
-import streamlit as st
-import hashlib
-import functools
 import datetime
-import pdfplumber  # Using pdfplumber instead of PyMuPDF
+import functools
+import hashlib
+
 import ollama
-import httpx
-import feedparser
-import os
-from serpapi.google_search import GoogleSearch
-from jobs.search_api import fetch_google_jobs_serpapi, enhanced_jobicy_search
+import pdfplumber  # Using pdfplumber instead of PyMuPDF
+import streamlit as st
+
+from data.db import get_db_status, init_db, list_jobs, update_job_status, upsert_jobs
+from jobs.search_api import enhanced_jobicy_search, fetch_google_jobs_serpapi
 # CRITICAL: set_page_config MUST be the very first Streamlit command
 st.set_page_config(page_title="AI Resume Analyzer + Job Finder", layout="wide")
-
-# ────────────────────────────────────────────────  CONFIG  ──────────────────────────────────────────────
-def get_serpapi_key():
-    """Get SERPAPI key from environment or Streamlit secrets"""
-    try:
-        return st.secrets.get("SERPAPI_KEY", os.getenv("SERPAPI_KEY"))
-    except Exception:
-        return os.getenv("SERPAPI_KEY")
+init_db()
 
 # ──────────────────── PDF ➞ TEXT (sanitised) ────────────────────
 def extract_text_from_pdf(upload, max_chars=60_000) -> str:
@@ -122,112 +114,6 @@ def detect_suitable_job_roles(resume_text: str, resume_hash: str) -> dict:
     
     return parsed_roles
 
-# ──────────── PROPER SERPAPI GOOGLE JOBS IMPLEMENTATION ────────────
-def fetch_google_jobs_serpapi(detected_roles: dict, location: str = "Remote", limit: int = 15):
-    """Fetch jobs using proper SerpAPI Google Jobs API implementation."""
-    api_key = get_serpapi_key()
-    if not api_key:
-        print("SERPAPI_KEY not set. Skipping Google Jobs search.")
-        return []
-    
-    all_jobs = []
-    
-    # Create search queries based on AI recommendations
-    search_queries = [
-        detected_roles["primary_role"],
-        f"{detected_roles['primary_role']} {detected_roles['career_level'].lower()}",
-    ]
-    
-    # Add alternative roles and keywords
-    search_queries.extend(detected_roles["alternative_roles"][:2])
-    search_queries.extend(detected_roles["recommended_keywords"][:2])
-    
-    for query in search_queries:
-        if len(all_jobs) >= limit:
-            break
-            
-        # Proper SerpAPI Google Jobs parameters based on documentation[1][2]
-        params = {
-            "engine": "google_jobs",           # Required: Set to google_jobs
-            "q": f"{query} remote",            # Search query
-            "location": location,              # Geographic location
-            "hl": "en",                       # Language (English)
-            "gl": "us",                       # Country (US)
-            "api_key": api_key,               # Your SerpAPI key
-            "no_cache": False                 # Allow cached results for faster response
-        }
-        
-        try:
-            search = GoogleSearch(params)
-            results = search.get_dict()
-            
-            # Check for errors in response
-            if 'error' in results:
-                print(f"SerpAPI Error: {results['error']}")
-                continue
-            
-            jobs_results = results.get("jobs_results", [])
-            
-            for job in jobs_results:
-                if len(all_jobs) >= limit:
-                    break
-                
-                # Extract job data according to SerpAPI response structure[6]
-                job_data = {
-                    "title": job.get("title"),
-                    "company": job.get("company_name"),
-                    "location": job.get("location"),
-                    "link": job.get("related_links", [{}])[0].get("link") if job.get("related_links") else None,
-                    "posted": job.get("detected_extensions", {}).get("posted_at"),
-                    "schedule_type": job.get("detected_extensions", {}).get("schedule_type"),
-                    "via": job.get("via"),
-                    "job_id": job.get("job_id"),
-                    "thumbnail": job.get("thumbnail"),
-                    "description": job.get("description"),
-                    "match_reason": f"Matches: {query}"
-                }
-                
-                # Avoid duplicates
-                if not any(existing_job["title"] == job_data["title"] and 
-                         existing_job["company"] == job_data["company"] 
-                         for existing_job in all_jobs):
-                    all_jobs.append(job_data)
-            
-        except Exception as e:
-            print(f"Google Jobs fetch failed for query '{query}': {e}")
-            continue
-    
-    return all_jobs
-
-# ──────────── FALLBACK SOURCES WITH AI KEYWORDS ────────────
-def enhanced_jobicy_search(detected_roles: dict, limit: int = 10):
-    """Search Jobicy using AI-detected keywords."""
-    try:
-        data = httpx.get("https://jobs.jobicy.com/api/v2/remote-jobs", timeout=15).json().get("jobs", [])
-        cutoff = datetime.date.today() - datetime.timedelta(days=30)
-        
-        # Use AI-recommended keywords for better matching
-        search_terms = [detected_roles["primary_role"]] + detected_roles["recommended_keywords"]
-        
-        matched_jobs = []
-        for job in data:
-            job_date = datetime.date.fromisoformat(job["published_at"][:10])
-            if job_date >= cutoff:
-                for term in search_terms:
-                    if term.lower() in job["title"].lower() or term.lower() in job.get("description", "").lower():
-                        matched_jobs.append({
-                            "url": job["url"],
-                            "title": job["title"],
-                            "company": job.get("company_name", "Unknown"),
-                            "match_reason": f"Matches: {term}"
-                        })
-                        break
-        
-        return matched_jobs[:limit]
-    except Exception as e:
-        print(f"Jobicy API error: {e}")
-        return []
-
 # ──────────────────── MAIN STREAMLIT APP ────────────────────
 st.title("🤖 AI-Powered Resume Analyzer + Smart Job Finder")
 st.caption("Upload your résumé and let AI intelligently detect the best job roles for you!")
@@ -252,6 +138,77 @@ def _display_jobs(jobs: list[dict]):
         link_md = f"[Apply]({link})" if link else ""
         rows.append(f"| {title} | {company} | {loc} | {posted} | {typ} | {reason} | {link_md} |")
     st.markdown("\n".join([header, divider] + rows), unsafe_allow_html=True)
+
+def _display_tracked_jobs(tracked_jobs: list[dict]):
+    """Render tracked jobs in a compact table."""
+    if not tracked_jobs:
+        st.write("_No tracked jobs yet._")
+        return
+    cols = ["Title", "Company", "Location", "Status", "Updated", "Link"]
+    header = "| " + " | ".join(cols) + " |"
+    divider = "|" + "|".join(["---"] * len(cols)) + "|"
+    rows = []
+    for job in tracked_jobs:
+        link = job.get("link") or ""
+        link_md = f"[Open]({link})" if link else ""
+        rows.append(
+            f"| {job.get('title', '')} | {job.get('company', '')} | {job.get('location', '')} | "
+            f"{job.get('status', '')} | {job.get('updated_at', '')} | {link_md} |"
+        )
+    st.markdown("\n".join([header, divider] + rows), unsafe_allow_html=True)
+
+st.sidebar.subheader("📌 Tracked Jobs")
+status_filter = st.sidebar.selectbox(
+    "Status filter",
+    ["all", "new", "reviewed", "applied", "archived"],
+    index=0,
+)
+
+with st.sidebar.expander("🧪 Debug info"):
+    db_status = get_db_status()
+    st.write(f"DB path: `{db_status['db_path']}`")
+    st.write(f"Tables: {', '.join(db_status['tables']) if db_status['tables'] else 'None'}")
+    st.write(f"Job count: {db_status['jobs_count']}")
+    st.write(f"Last job insert: {db_status['last_job_insert'] or 'None'}")
+
+st.subheader("📌 Tracked Jobs")
+tracked = list_jobs(status_filter)
+_display_tracked_jobs(tracked)
+
+if tracked:
+    with st.expander("Update job status"):
+        job_options = {
+            f"{job['title']} @ {job.get('company', 'Unknown')} (#{job['id']})": job["id"]
+            for job in tracked
+        }
+        selected_job_label = st.selectbox("Select a job", list(job_options.keys()))
+        selected_status = st.selectbox(
+            "Set status to",
+            ["new", "reviewed", "applied", "archived"],
+            index=0,
+        )
+        if st.button("Update status"):
+            update_job_status(job_options[selected_job_label], selected_status)
+            st.success("Job status updated.")
+
+with st.expander("Seed tracking data"):
+    st.write("Insert a sample job to validate tracking without external APIs.")
+    if st.button("Seed job"):
+        created, updated = upsert_jobs(
+            [
+                {
+                    "title": "Data Analyst (Sample)",
+                    "company": "Example Analytics",
+                    "location": "Remote",
+                    "link": "https://example.com/jobs/data-analyst",
+                    "posted": datetime.date.today().isoformat(),
+                    "schedule_type": "Full-time",
+                    "match_reason": "Seed data",
+                }
+            ],
+            "seed",
+        )
+        st.success(f"Seeded {created} new job(s), refreshed {updated} existing.")
 
 uploaded_file = st.file_uploader("📄 Upload your résumé (PDF only)", type=["pdf"])
 
@@ -316,6 +273,8 @@ if uploaded_file:
             google_jobs = fetch_google_jobs_serpapi(detected_roles, final_location)
             
             if google_jobs:
+                created, updated = upsert_jobs(google_jobs, "serpapi_google_jobs")
+                st.info(f"Tracked {created} new jobs, refreshed {updated} existing jobs.")
                 st.success(f"🎉 Found {len(google_jobs)} highly relevant job matches via SerpAPI!")
                 with st.expander("🌐 Google Jobs - SerpAPI Results", expanded=True):
                     _display_jobs(google_jobs)
@@ -325,6 +284,8 @@ if uploaded_file:
                 fallback_jobs = enhanced_jobicy_search(detected_roles)
                 
                 if fallback_jobs:
+                    created, updated = upsert_jobs(fallback_jobs, "jobicy_rss")
+                    st.info(f"Tracked {created} new jobs, refreshed {updated} existing jobs.")
                     st.success(f"✨ Found {len(fallback_jobs)} additional opportunities!")
                     with st.expander("🌟 Additional Job Opportunities", expanded=True):
                         _display_jobs(fallback_jobs)
